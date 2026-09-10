@@ -60,7 +60,7 @@ jobs:
     outputs:
       go: ${{ steps.decide.outputs.go }}
     steps:
-      - name: Random time slot gate (daily-changing random upload time)
+      - name: Smart upload gate (schedule from Firebase, daily random slot, catch-up)
         id: decide
         shell: bash
         run: |
@@ -69,25 +69,70 @@ jobs:
             echo "Force run enabled - skipping random gate."
             exit 0
           fi
-          node -e "
-            const WINDOWS = [11, 17, 21];          // window start hours (Asia/Dhaka)
-            const WINDOW_HOURS = 3;                 // each window lasts 3 hours
-            const SLOT_MIN = 30;                    // scheduler triggers every 30 min
-            const now = new Date(Date.now() + 6 * 3600 * 1000); // UTC+6 Dhaka
-            const h = now.getUTCHours(), m = now.getUTCMinutes();
-            const dateKey = now.toISOString().slice(0, 10);
-            const wIdx = WINDOWS.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
-            if (wIdx < 0) { console.log('Outside upload windows - skip.'); process.exit(2); }
-            const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
-            const minsIn = (h - WINDOWS[wIdx]) * 60 + m;
-            const curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
+          cat > gate.mjs <<'GATE_EOF'
+          // ---- v9 smart gate -------------------------------------------------
+          // Schedule lives in Firebase: dashboardSettings/schedule = { windows: [h,h,h] }
+          // (edit it from the dashboard / app). cron-job.org just pings every 30 min
+          // all day; this gate decides. Falls back to DEFAULT_WINDOWS if Firebase is
+          // unreachable. Health + run markers are written to dashboardSettings/gate.
+          const DB = "https://zedge-4-default-rtdb.asia-southeast1.firebasedatabase.app";
+          const ACCOUNT = "ZEDGE4";
+          const DEFAULT_WINDOWS = [11, 17, 21];   // window start hours (Asia/Dhaka) - fallback only
+          const WINDOW_HOURS = 3;                      // each window lasts 3 hours
+          const SLOT_MIN = 30;                         // scheduler pings every 30 min
+          const RUN_ID = process.env.GITHUB_RUN_ID || "";
+
+          const dhaka = new Date(Date.now() + 6 * 3600 * 1000);   // UTC+6
+          const h = dhaka.getUTCHours(), m = dhaka.getUTCMinutes();
+          const dateKey = dhaka.toISOString().slice(0, 10);
+          const hhmm = String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+          const jget = async (path) => { const r = await fetch(`${DB}/${path}.json`); if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`); return r.json(); };
+          const jwrite = async (path, method, body) => { const r = await fetch(`${DB}/${path}.json`, { method, body: JSON.stringify(body) }); if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`); };
+
+          let windows = DEFAULT_WINDOWS, source = "yml-default";
+          try {
+            const s = await jget("dashboardSettings/schedule");
+            const w = s && Array.isArray(s.windows) ? s.windows.map(Number).filter(x => Number.isInteger(x) && x >= 0 && x <= 23) : null;
+            if (w && w.length) { windows = w; source = "firebase"; }
+          } catch (e) { console.log("Schedule read failed (" + e.message + ") - using yml defaults."); }
+
+          let runsToday = {}, runsKnown = false;
+          try { runsToday = (await jget(`dashboardSettings/gate/runs/${dateKey}`)) || {}; runsKnown = true; }
+          catch (e) { console.log("Run log read failed (" + e.message + ") - catch-up disabled for this ping."); }
+
+          const wIdx = windows.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
+          const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
+          let decision = "outside", go = false, curSlot = -1, chosen = -1;
+          if (wIdx >= 0) {
+            const minsIn = (h - windows[wIdx]) * 60 + m;
+            curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
             let hash = 0;
-            const seed = dateKey + '#' + wIdx + '#ZEDGE4';
+            const seed = dateKey + "#" + wIdx + "#" + ACCOUNT;
             for (const c of seed) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
-            const chosen = hash % slotsPerWindow;
-            console.log('Date ' + dateKey + ' | window ' + wIdx + ' | chosen slot ' + chosen + ' | current slot ' + curSlot);
-            process.exit(curSlot === chosen ? 0 : 2);
-          " && echo "go=yes" >> "$GITHUB_OUTPUT" || echo "go=no" >> "$GITHUB_OUTPUT"
+            chosen = hash % slotsPerWindow;
+            if (runsToday && runsToday[wIdx]) decision = "done";                 // this window already ran today
+            else if (curSlot === chosen) { decision = "run"; go = true; }
+            else if (curSlot > chosen && runsKnown) { decision = "catch-up"; go = true; }  // chosen slot was missed -> run now
+            else decision = "wait";
+          }
+          console.log(`Date ${dateKey} ${hhmm} (Dhaka) | windows ${JSON.stringify(windows)} (${source}) | window ${wIdx} | chosen slot ${chosen} | current slot ${curSlot} | decision: ${decision}`);
+
+          try {
+            await jwrite("dashboardSettings/gate", "PATCH", { lastPing: Date.now(), lastPingDhaka: `${dateKey} ${hhmm}`, lastDecision: decision, lastWindow: wIdx, windowsUsed: windows, windowsSource: source, lastRunId: RUN_ID });
+          } catch (e) { console.log("Health log failed: " + e.message); }
+
+          if (go) {
+            try {
+              const all = (await jget("dashboardSettings/gate/runs")) || {};
+              const today = Object.assign({}, all[dateKey] || {});
+              today[wIdx] = { at: Date.now(), dhaka: hhmm, slot: curSlot, chosen, catchUp: decision === "catch-up", runId: RUN_ID };
+              await jwrite("dashboardSettings/gate/runs", "PUT", { [dateKey]: today });   // keeps only today
+              await jwrite("dashboardSettings/gate", "PATCH", { lastRun: Date.now(), lastRunDhaka: `${dateKey} ${hhmm}`, lastRunWindow: wIdx });
+            } catch (e) { console.log("Run marker failed: " + e.message); }
+          }
+          process.exit(go ? 0 : 2);
+          GATE_EOF
+          node gate.mjs && echo "go=yes" >> "$GITHUB_OUTPUT" || echo "go=no" >> "$GITHUB_OUTPUT"
 
   automation:
     needs: gate

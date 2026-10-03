@@ -82,6 +82,10 @@ jobs:
       - name: Smart upload gate (schedule from Firebase, daily random slot, catch-up)
         id: decide
         shell: bash
+        env:
+          # v28 security: the database URL comes from GitHub Secrets (never written in this file)
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
         run: |
           if [ "${{ inputs.force_run }}" = "true" ]; then
             echo "go=yes" >> "$GITHUB_OUTPUT"
@@ -99,7 +103,8 @@ jobs:
           //   exact=true  -> upload starts at HH:MM sharp (the gate sleeps until that minute if the ping came early;
           //                  a missed ping is caught up on the next ping within the same 3 h window).
           // Falls back to DEFAULT_WINDOWS if Firebase is unreachable. Health + run markers -> dashboardSettings/gate.
-          const DB = "https://zedge-4-default-rtdb.asia-southeast1.firebasedatabase.app";
+          const DB = (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
+          if (!DB) { console.log("::error::GitHub secret ZEDGE4_DB_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions"); process.exit(1); }
           const ACCOUNT = "ZEDGE4";
           const DEFAULT_WINDOWS = [11, 17, 21];   // window start hours (Asia/Dhaka) - fallback only
           const WINDOW_HOURS = 3;                      // each window lasts 3 hours
@@ -945,7 +950,8 @@ jobs:
         shell: pwsh
         timeout-minutes: 15
         env:
-          FIREBASE_DB_URL: "https://zedge-4-default-rtdb.asia-southeast1.firebasedatabase.app"
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
           ACCOUNT_LABEL: "Zedge 4"
           RUN_MODE: ${{ inputs.run_mode }}
           VPN_PROFILE: ${{ inputs.vpn_profile }}
@@ -971,9 +977,13 @@ jobs:
           const zedgePassword = process.env.ZEDGE_PASSWORD;
           const isHeadless = process.env.HEADLESS === "true";
 
-          const firebaseDatabaseURL = "https://zedge-4-default-rtdb.asia-southeast1.firebasedatabase.app";
+          // v28 security: database URL comes from the GitHub secret ZEDGE4_DB_URL (env FIREBASE_DB_URL)
+          const firebaseDatabaseURL = (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
+          if (!firebaseDatabaseURL) throw new Error("GitHub secret ZEDGE4_DB_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions");
           const queuePath = "wallpaperQueue";
-          const r2WorkerUrl = "https://frosty-pine-2f7dzedge-r2-gateway.holaexplainer.workers.dev"; // Update to your Cloudflare Worker URL
+          // v28 security: R2 worker URL comes from the GitHub secret R2_WORKER_URL
+          const r2WorkerUrl = (process.env.R2_WORKER_URL || "").trim().replace(/\/+$/, "");
+          if (!r2WorkerUrl) throw new Error("GitHub secret R2_WORKER_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions");
 
           if (!zedgeEmail) throw new Error("Zedge email is required");
           if (!zedgePassword) throw new Error("Zedge password is required");
@@ -1044,8 +1054,10 @@ jobs:
           }
 
           async function sendTelegramNotification(message) {
-            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
-            const chatId = "680349125";
+            // v28 security: bot token + chat id come from GitHub Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId) { console.log("Telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret not set"); return; }
             try {
               const url = `https://api.telegram.org/bot${token}/sendMessage`;
               const res = await fetch(url, {
@@ -1163,8 +1175,10 @@ jobs:
           }
 
           async function sendTelegramAttachment(filePath, type = "image", caption = "", extra = {}) {
-            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
-            const chatId = "680349125";
+            // v28 security: bot token + chat id come from GitHub Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)
+            const token = process.env.TELEGRAM_BOT_TOKEN || "";
+            const chatId = process.env.TELEGRAM_CHAT_ID || "";
+            if (!token || !chatId) { console.log("Telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret not set"); return; }
             try {
               if (!fs.existsSync(filePath)) {
                 console.log(`Telegram attachment file not found: ${filePath}`);
@@ -3628,8 +3642,14 @@ jobs:
           PROXY_SERVER: ${{ github.event.inputs.proxy_server }}
           PROXY_USER: ${{ github.event.inputs.proxy_user }}
           PROXY_PASS: ${{ github.event.inputs.proxy_pass }}
-          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email }}
-          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password }}
+          # v28: login from the dispatch inputs, or (safer) from the GitHub secrets ZEDGE4_EMAIL / ZEDGE4_PASSWORD
+          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email || secrets.ZEDGE4_EMAIL }}
+          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password || secrets.ZEDGE4_PASSWORD }}
+          # v28 security: all secrets below live in GitHub Secrets, never in this file
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}

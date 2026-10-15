@@ -1372,6 +1372,70 @@ jobs:
                 }),
               }).catch(() => {});
             } catch (e) { earnLog("firebase save failed: " + e.message); }
+            await earnTelegram(payload);
+          }
+
+          /* Professional earnings card on Telegram, sent with every upload run. */
+          function earnEsc(s) {
+            return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          }
+
+          function earnBar(part, total) {
+            const p = Math.max(0, Math.min(1, (Number(part) || 0) / (Number(total) || 1)));
+            const filled = Math.round(p * 10);
+            return "\u2588".repeat(filled) + "\u2591".repeat(10 - filled) + "  " + Math.round(p * 100) + "%";
+          }
+
+          async function earnTelegram(p) {
+            const money = (v) => (v == null || isNaN(v) ? "--" : "$" + Number(v).toFixed(2));
+            const num = (v) => (v == null || isNaN(v) ? "--" : Number(v).toLocaleString("en-US"));
+            const slash = (d) => (d ? String(d).replace(/-/g, "/") : "--");
+            const payable = p.mtdRevenue != null ? p.mtdRevenue : p.netRevenue;
+            const threshold = Number(p.threshold || 50);
+            const remaining = Math.max(0, threshold - (Number(payable) || 0));
+
+            const lines = [
+              "\uD83D\uDCCA <b>আর্নিং রিপোর্ট</b>",
+              "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+              `\uD83D\uDCC1 <b>অ্যাকাউন্ট:</b> ${earnEsc(p.account || "Zedge")}`,
+              `\uD83D\uDDD3 <b>হিসাবের সময়কাল:</b> ${earnEsc(slash(p.periodStart))} \u2192 ${earnEsc(slash(p.periodEnd))}`,
+              "",
+              `\uD83D\uDD13 <b>আনলক:</b> ${num(p.unlocks)}`,
+              `\uD83D\uDC65 <b>ইউজার:</b> ${num(p.users)}`,
+              `\uD83D\uDCB5 <b>নেট রেভিনিউ:</b> ${money(p.netRevenue)}`,
+              `\uD83D\uDCB0 <b>এখন পাওনা:</b> ${money(payable)}`,
+              "",
+              `\uD83C\uDFAF <b>পেমেন্ট থ্রেশহোল্ড</b> (${money(threshold)})`,
+              `<code>${earnBar(payable, threshold)}</code>`,
+              p.payoutExpected
+                ? "\u2705 <b>থ্রেশহোল্ড পূর্ণ হয়েছে - এই সাইকেলেই পেমেন্ট আসার কথা।</b>"
+                : `\u23F3 পেমেন্ট পেতে আরও ${money(remaining)} দরকার।`,
+              "",
+              `\uD83E\uDDFE <b>সর্বশেষ পেমেন্ট:</b> ${p.lastPayment ? earnEsc(p.lastPayment) + " \u2022 " + money(p.lastPaymentAmount) : "এখনো কোনো পেমেন্ট পাওয়া যায়নি"}`,
+              p.lastPaymentDate ? `\uD83D\uDCC5 <b>পেমেন্টের তারিখ:</b> ${earnEsc(p.lastPaymentDate)}` : "",
+              p.dailyPeak ? `\uD83D\uDCC8 <b>সেরা দিনের আয়:</b> ${money(p.dailyPeak)}` : "",
+              "",
+              `\uD83D\uDD04 এই আপলোড রানের শেষে সংগ্রহ করা \u2022 বিস্তারিত রিপোর্ট ড্যাশবোর্ডে`,
+            ].filter(Boolean);
+
+            const text = lines.join("\n");
+            try {
+              if (typeof sendTelegramNotification === "function") {
+                await sendTelegramNotification(text);
+                earnLog("earnings report sent to Telegram");
+                return;
+              }
+              const token = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+              const chatId = (process.env.TELEGRAM_CHAT_ID || "").trim();
+              if (!token || !chatId) { earnLog("Telegram skipped: token/chat id not set"); return; }
+              const api = "https://api.telegram.org/bot" + token + "/sendMessage";
+              const res = await fetch(api, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
+              });
+              earnLog(`earnings report sent to Telegram (${res.status})`);
+            } catch (e) { earnLog("Telegram earnings report failed: " + e.message); }
           }
 
           /* Main entry - called once the publish run is finished. */

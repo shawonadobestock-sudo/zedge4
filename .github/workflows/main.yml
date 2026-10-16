@@ -969,7 +969,7 @@ jobs:
           const { chromium } = require("playwright");
 
           /* ------------------------------------------------------------------ */
-          /* MH-EARNINGS v3 - after every publish run the bot reads the Zedge     */
+          /* MH-EARNINGS v4 - after every publish run the bot reads the Zedge     */
           /* dashboard (stat cards + daily chart + payments history) and pushes   */
           /* it into this account's Firebase: dashboardSettings/earnings.         */
           /* ------------------------------------------------------------------ */
@@ -1186,51 +1186,125 @@ jobs:
             await page.waitForTimeout(9000);
           }
 
-          /* Reads the three stat cards (Unlocks / Users / Net revenue). */
+          /* Waits until the Zedge dashboard has really finished rendering: the stat cards
+             must show a value and the daily chart must have bars. This is the fix for the
+             runs that reported "--" / "no daily data". */
+          async function earnWaitDashboard(page, tries) {
+            var max = tries || 12;
+            for (var i = 1; i <= max; i++) {
+              var ok = await page.evaluate(() => {
+                var txt = (document.body.innerText || "").toLowerCase();
+                var hasLabels = txt.indexOf("unlocks") >= 0 && txt.indexOf("net revenue") >= 0;
+                var hasMoney = /\$\s?[\d,]+(?:\.\d{1,2})?/.test(document.body.innerText || "");
+                var bars = document.querySelectorAll('g[role="listitem"]').length;
+                return hasLabels && hasMoney && bars > 5;
+              }).catch(() => false);
+              if (ok) { earnLog("dashboard ready after " + i + " check(s)"); return true; }
+              await page.waitForTimeout(3000);
+            }
+            earnLog("dashboard still not fully rendered after " + max + " checks");
+            return false;
+          }
+
+          /* Reads the three stat cards (Unlocks / Users / Net revenue) straight from the
+             DOM, together with the little sparkline that sits under each value. */
           async function earnReadCards(page) {
             return await page.evaluate(() => {
-              const num = (s) => {
-                const t = String(s).replace(/[$,\s]/g, "");
-                const m = t.match(/^(-?\d+(?:\.\d+)?)([kKmM])?$/);
+              var num = (s) => {
+                var t = String(s).replace(/[$,\s]/g, "");
+                var m = t.match(/^(-?\d+(?:\.\d+)?)([kKmM])?$/);
                 if (!m) return null;
-                let v = Number(m[1]);
+                var v = Number(m[1]);
                 if (/k/i.test(m[2] || "")) v *= 1000;
                 if (/m/i.test(m[2] || "")) v *= 1000000;
                 return v;
               };
-              const lines = (document.body.innerText || "").split(/\n+/).map((l) => l.trim()).filter(Boolean);
-              const pick = (label) => {
-                for (let i = 0; i < lines.length; i++) {
-                  if (!new RegExp(`^${label}$`, "i").test(lines[i])) continue;
-                  for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
-                    const v = num(lines[j]);
+              var leaves = [...document.querySelectorAll("span,div,p,h1,h2,h3,h4")].filter(
+                (el) => el.children.length === 0 && (el.textContent || "").trim()
+              );
+              var sparkOf = (card) => {
+                if (!card) return [];
+                var svg = card.querySelector("svg");
+                if (!svg) return [];
+                var box = svg.querySelector("rect");
+                var h = box ? Number(box.getAttribute("height")) || 40 : 40;
+                var best = null;
+                svg.querySelectorAll("path").forEach((p) => {
+                  var d = p.getAttribute("d") || "";
+                  if (/Z\s*$/.test(d.trim())) return;
+                  var n = (d.match(/C/g) || []).length;
+                  if (n > 3 && (!best || n > best.n)) best = { n: n, d: d };
+                });
+                if (!best) return [];
+                var pts = [];
+                var re = /[-\d.]+\s*,\s*([-\d.]+)/g;
+                var m;
+                while ((m = re.exec(best.d))) {
+                  var y = Number(m[1]);
+                  if (isNaN(y)) continue;
+                  var f = (h - y) / h;
+                  pts.push(Math.max(0, Math.min(1, Number(f.toFixed(4)))));
+                }
+                return pts.slice(0, 120);
+              };
+              var pick = (label) => {
+                var rx = new RegExp("^" + label + "$", "i");
+                for (var i = 0; i < leaves.length; i++) {
+                  if (!rx.test((leaves[i].textContent || "").trim())) continue;
+                  var card = leaves[i].parentElement;
+                  if (!card) continue;
+                  var kids = [...card.querySelectorAll("span,div")].filter((el) => el.children.length === 0);
+                  for (var j = 0; j < kids.length; j++) {
+                    var raw = (kids[j].textContent || "").trim();
+                    if (!raw || rx.test(raw)) continue;
+                    var v = num(raw);
+                    if (v != null) return { value: v, spark: sparkOf(card) };
+                  }
+                }
+                return { value: null, spark: [] };
+              };
+              var fallback = (label) => {
+                var lines = (document.body.innerText || "").split(/\n+/).map((l) => l.trim()).filter(Boolean);
+                var rx = new RegExp("^" + label + "$", "i");
+                for (var i = 0; i < lines.length; i++) {
+                  if (!rx.test(lines[i])) continue;
+                  for (var j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+                    var v = num(lines[j]);
                     if (v != null) return v;
                   }
                 }
                 return null;
               };
-              return { unlocks: pick("unlocks"), users: pick("users"), netRevenue: pick("net revenue") };
+              var u = pick("unlocks");
+              var s = pick("users");
+              var r = pick("net revenue");
+              return {
+                unlocks: u.value != null ? u.value : fallback("unlocks"),
+                users: s.value != null ? s.value : fallback("users"),
+                netRevenue: r.value != null ? r.value : fallback("net revenue"),
+                spark: { unlocks: u.spark, users: s.spark, netRevenue: r.spark },
+              };
             });
           }
 
           /* Reads the Net revenue total for the range currently applied. */
           async function earnReadNetRevenue(page) {
-            const cards = await earnReadCards(page);
+            var cards = await earnReadCards(page);
             if (cards && cards.netRevenue != null) {
-              return { value: cards.netRevenue, source: "card", cards };
+              return { value: cards.netRevenue, source: "card", cards: cards };
             }
-            const got = await page.evaluate(() => {
-              const body = document.body.innerText || "";
-              const clean = (s) => Number(String(s).replace(/[$,\s]/g, ""));
-              const lines = body.split(/\n+/).map((l) => l.trim()).filter(Boolean);
-              for (let i = 0; i < lines.length; i++) {
+            var got = await page.evaluate(() => {
+              var body = document.body.innerText || "";
+              var clean = (s) => Number(String(s).replace(/[$,\s]/g, ""));
+              var lines = body.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+              for (var i = 0; i < lines.length; i++) {
                 if (!/net\s*revenue|total\s*revenue|earnings/i.test(lines[i])) continue;
-                for (let j = i; j < Math.min(i + 4, lines.length); j++) {
-                  const m = lines[j].match(/\$\s?[\d,]+(?:\.\d+)?/);
+                for (var j = i; j < Math.min(i + 4, lines.length); j++) {
+                  var m = lines[j].match(/\$\s?[\d,]+(?:\.\d+)?/);
                   if (m) return { value: clean(m[0]), source: "label" };
                 }
               }
-              const all = [...body.matchAll(/\$\s?[\d,]+(?:\.\d{1,2})?/g)].map((m) => clean(m[0])).filter((n) => !isNaN(n));
+              var all = [...body.matchAll(/\$\s?[\d,]+(?:\.\d{1,2})?/g)].map((m) => clean(m[0])).filter((n) => !isNaN(n));
               if (all.length) return { value: Math.max(...all), source: "max-amount" };
               return null;
             });
@@ -1238,65 +1312,181 @@ jobs:
             return got;
           }
 
-          /* Reads the "Daily overview" chart: one point per day, estimated from the
-             stacked bar heights and the y-axis scale. Used for the dashboard chart. */
+          /* Reads the "Daily overview" chart candle by candle. Every bar group carries its
+             own series name (Ad skips / Ad plays / Zedge credits) so each day can be split
+             into the three parts, exactly like the Zedge tooltip shows. */
           async function earnReadDaily(page) {
             try {
-              return await page.evaluate(() => {
-                const svgs = [...document.querySelectorAll("svg")];
-                let host = null;
-                for (const s of svgs) {
-                  if (s.querySelectorAll('g[role="listitem"]').length > 10) { host = s; break; }
-                }
-                if (!host) return null;
-                /* y-axis scale: biggest "$n" tick label inside the chart */
-                let axisMax = 0;
-                host.querySelectorAll("text").forEach((t) => {
-                  const m = (t.textContent || "").trim().match(/^\$\s?([\d.]+)$/);
-                  if (m) axisMax = Math.max(axisMax, Number(m[1]));
+              var raw = await page.evaluate(() => {
+                var svgs = [...document.querySelectorAll("svg")];
+                var host = null;
+                var most = 0;
+                svgs.forEach((s) => {
+                  var n = s.querySelectorAll('g[role="listitem"]').length;
+                  if (n > most) { most = n; host = s; }
                 });
-                const series = [...host.querySelectorAll('g[role="group"][aria-label]')].filter(
-                  (g) => g.querySelectorAll('g[role="listitem"]').length > 5
-                );
-                if (!series.length) return null;
-                const plotH = 296;
-                const buckets = new Map();
-                let maxPx = 0;
-                for (const g of series) {
-                  const name = g.getAttribute("aria-label") || "";
-                  [...g.querySelectorAll('g[role="listitem"]')].forEach((item, i) => {
-                    const tr = item.getAttribute("transform") || "";
-                    const xy = tr.match(/translate\(([-\d.]+),\s*([-\d.]+)\)/);
-                    const x = xy ? Number(xy[1]) : i;
-                    const p = item.querySelector("path");
-                    const d = p ? p.getAttribute("d") || "" : "";
-                    const ys = [...d.matchAll(/[ML]\s*[\d.]+,\s*([\d.]+)/g)].map((q) => Number(q[1]));
-                    const h = ys.length ? Math.max.apply(null, ys) : 0;
-                    const key = Math.round(x);
-                    const cur = buckets.get(key) || { x: key, total: 0, parts: {} };
-                    cur.parts[name] = (cur.parts[name] || 0) + h;
-                    cur.total += h;
-                    buckets.set(key, cur);
-                    maxPx = Math.max(maxPx, cur.total);
-                  });
-                }
-                const rows = [...buckets.values()].sort((a, b) => a.x - b.x);
-                if (!rows.length) return null;
-                const scale = axisMax > 0 && plotH > 0 ? axisMax / plotH : 0;
-                const labels = [...host.querySelectorAll("text")]
-                  .map((t) => (t.textContent || "").trim())
-                  .filter((t) => /^[A-Z][a-z]{2}\s?\d{1,2}$/.test(t));
-                return {
-                  axisMax,
-                  labels: labels.slice(0, 40),
-                  points: rows.map((r) => ({
-                    v: scale ? Number((r.total * scale).toFixed(4)) : Number(r.total.toFixed(2)),
-                    raw: Number(r.total.toFixed(2)),
-                  })),
-                  peak: scale ? Number((maxPx * scale).toFixed(4)) : Number(maxPx.toFixed(2)),
-                  source: scale ? "axis-scaled" : "pixels",
+                if (!host || most < 2) return null;
+
+                var ty = (el) => {
+                  var t = el.getAttribute("transform") || "";
+                  var m = t.match(/translate\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)/);
+                  return m ? { x: Number(m[1]), y: Number(m[2]) } : { x: 0, y: 0 };
                 };
+                var accY = (el, stop) => {
+                  var y = 0;
+                  var cur = el;
+                  while (cur && cur !== stop) { y += ty(cur).y; cur = cur.parentElement; }
+                  return y;
+                };
+
+                /* y axis: use the visible "$n" ticks to get dollars per pixel */
+                var ticks = [];
+                host.querySelectorAll("text").forEach((t) => {
+                  var m = (t.textContent || "").trim().match(/^\$\s?(-?[\d.]+)$/);
+                  if (!m) return;
+                  var g = t.closest("g");
+                  if (!g) return;
+                  var hidden = false;
+                  var cur = g;
+                  while (cur && cur !== host) {
+                    if (cur.getAttribute && cur.getAttribute("display") === "none") { hidden = true; break; }
+                    cur = cur.parentElement;
+                  }
+                  if (hidden) return;
+                  ticks.push({ v: Number(m[1]), y: accY(g, host) });
+                });
+                var perPx = 0;
+                var axisMax = 0;
+                ticks.forEach((t) => { if (t.v > axisMax) axisMax = t.v; });
+                if (ticks.length >= 2) {
+                  var lo = ticks[0], hi = ticks[0];
+                  ticks.forEach((t) => { if (t.v < lo.v) lo = t; if (t.v > hi.v) hi = t; });
+                  var dy = Math.abs(lo.y - hi.y);
+                  if (dy > 1) perPx = Math.abs(hi.v - lo.v) / dy;
+                }
+
+                /* x axis day labels (skip the hidden ones) */
+                var labels = [];
+                host.querySelectorAll("text").forEach((t) => {
+                  var s = (t.textContent || "").trim();
+                  if (!/^[A-Z][a-z]{2}\s+\d{1,2}$/.test(s)) return;
+                  var g = t.closest("g");
+                  var hidden = false;
+                  var cur = g;
+                  while (cur && cur !== host) {
+                    if (cur.getAttribute && cur.getAttribute("display") === "none") { hidden = true; break; }
+                    cur = cur.parentElement;
+                  }
+                  if (hidden) return;
+                  var x = 0;
+                  cur = g;
+                  while (cur && cur !== host) { var p = ty(cur); if (p.y === 0) x += p.x; cur = cur.parentElement; }
+                  labels.push({ label: s, x: Number(x.toFixed(2)) });
+                });
+                labels.sort((a, b) => a.x - b.x);
+
+                /* one entry per series, one bar per day */
+                var out = [];
+                host.querySelectorAll('g[role="group"][aria-label]').forEach((grp) => {
+                  var name = grp.getAttribute("aria-label") || "";
+                  var items = grp.querySelectorAll('g[role="listitem"]');
+                  if (!name || name === "Series" || items.length < 2) return;
+                  var bars = [];
+                  items.forEach((it) => {
+                    var pos = ty(it);
+                    var h = 0;
+                    it.querySelectorAll("path").forEach((p) => {
+                      var d = p.getAttribute("d") || "";
+                      var re = /[MLla]?\s*-?[\d.]+\s*,\s*(-?[\d.]+)/g;
+                      var m;
+                      while ((m = re.exec(d))) {
+                        var v = Math.abs(Number(m[1]));
+                        if (!isNaN(v)) h = Math.max(h, v);
+                      }
+                    });
+                    bars.push({ x: Number(pos.x.toFixed(3)), h: Number(h.toFixed(3)) });
+                  });
+                  bars.sort((a, b) => a.x - b.x);
+                  out.push({ name: name, bars: bars });
+                });
+                if (!out.length) return null;
+                return { series: out, labels: labels, perPx: perPx, axisMax: axisMax };
               });
+
+              if (!raw) { earnLog("daily chart not found"); return null; }
+
+              var scale = raw.perPx > 0 ? raw.perPx : 0;
+              var count = 0;
+              raw.series.forEach((s) => { if (s.bars.length > count) count = s.bars.length; });
+              if (!count) return null;
+
+              /* map every bar index to a calendar date using the visible x labels */
+              var xs = [];
+              raw.series.forEach((s) => s.bars.forEach((b, i) => { xs[i] = b.x; }));
+              var steps = [];
+              for (var i = 1; i < xs.length; i++) { if (xs[i] != null && xs[i - 1] != null) steps.push(xs[i] - xs[i - 1]); }
+              steps.sort((a, b) => a - b);
+              var step = steps.length ? steps[Math.floor(steps.length / 2)] : 0;
+
+              var MON = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+              var today = new Date(Date.now() + 6 * 3600 * 1000);
+              var dates = [];
+              if (raw.labels.length >= 2 && step > 0) {
+                var first = raw.labels[0];
+                var mo = MON.indexOf(first.label.slice(0, 3).toLowerCase());
+                var day = Number(first.label.replace(/[^\d]/g, ""));
+                if (mo >= 0 && day > 0) {
+                  var year = today.getUTCFullYear();
+                  var probe = new Date(Date.UTC(year, mo, day));
+                  if (probe.getTime() > today.getTime() + 2 * 86400000) year -= 1;
+                  var startAt = new Date(Date.UTC(year, mo, day));
+                  /* how many bars sit before the first visible label */
+                  var offset = step > 0 ? Math.round((first.x - (xs[0] != null ? xs[0] : first.x)) / step) : 0;
+                  for (var k = 0; k < count; k++) {
+                    var dd = new Date(startAt.getTime() + (k - offset) * 86400000);
+                    dates.push(dd.toISOString().slice(0, 10));
+                  }
+                }
+              }
+
+              var keyOf = (name) => {
+                var n = String(name).toLowerCase();
+                if (n.indexOf("skip") >= 0) return "skips";
+                if (n.indexOf("play") >= 0) return "plays";
+                if (n.indexOf("credit") >= 0) return "credits";
+                return "other";
+              };
+              var fmtLabel = (iso, idx) => {
+                if (!iso) return "Day " + (idx + 1);
+                var d = new Date(iso + "T00:00:00Z");
+                return ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getUTCMonth()] + " " + earnPad(d.getUTCDate());
+              };
+
+              var rows = [];
+              for (var i2 = 0; i2 < count; i2++) {
+                var row = { date: dates[i2] || "", label: fmtLabel(dates[i2], i2), skips: 0, plays: 0, credits: 0, other: 0, total: 0 };
+                raw.series.forEach((s) => {
+                  var b = s.bars[i2];
+                  if (!b) return;
+                  var v = scale > 0 ? Number((b.h * scale).toFixed(4)) : Number(b.h.toFixed(4));
+                  row[keyOf(s.name)] = Number((row[keyOf(s.name)] + v).toFixed(4));
+                });
+                row.total = Number((row.skips + row.plays + row.credits + row.other).toFixed(4));
+                rows.push(row);
+              }
+
+              var peak = 0;
+              rows.forEach((r) => { if (r.total > peak) peak = r.total; });
+              earnLog("daily chart: " + rows.length + " days, " + raw.series.length + " series, peak $" + peak.toFixed(2));
+              return {
+                rows: rows,
+                series: raw.series.map((s) => s.name),
+                labels: rows.map((r) => r.label),
+                points: rows.map((r) => ({ label: r.label, v: r.total })),
+                peak: peak,
+                axisMax: raw.axisMax,
+                source: scale > 0 ? "axis-scaled" : "pixels",
+              };
             } catch (e) {
               earnLog("daily chart not readable: " + e.message);
               return null;
@@ -1329,8 +1519,21 @@ jobs:
               await page.waitForTimeout(2000);
             }
             earnLog(`range applied: ${shown || "(unknown)"}`);
-            const got = await earnReadNetRevenue(page);
-            if (got) got.daily = await earnReadDaily(page);
+            /* v4: the dashboard renders asynchronously, so wait for it and retry the read.
+               This is what used to cause the empty "--" / "no daily data" reports. */
+            let got = null;
+            for (let read = 1; read <= 3; read++) {
+              await earnWaitDashboard(page, read === 1 ? 12 : 6);
+              got = await earnReadNetRevenue(page);
+              if (got) got.daily = await earnReadDaily(page);
+              const okCards = got && got.cards && got.cards.unlocks != null;
+              const okDaily = got && got.daily && got.daily.rows && got.daily.rows.length > 1;
+              if (got && got.value != null && okCards && okDaily) break;
+              if (read < 3) {
+                earnLog(`read ${read}: incomplete (value=${got ? got.value : "-"}, cards=${okCards}, daily=${okDaily}) - retrying`);
+                await page.waitForTimeout(5000);
+              }
+            }
             earnLog(`${earnIso(start.y, start.m, start.d)} -> ${earnIso(end.y, end.m, end.d)} = ${got ? "$" + got.value + " (" + got.source + ")" : "not readable"}`);
             return got;
           }
@@ -1499,7 +1702,12 @@ jobs:
               rangeEnd: shown === mtd && mtd ? earnIso(curY, curM, earnDaysInMonth(curY, curM)) : earnIso(prevEnd.y, prevEnd.m, prevEnd.d),
               daily: daily ? daily.points.map((p) => p.v) : [],
               dailyLabels: daily ? daily.labels : [],
+              dailyRows: daily && daily.rows ? daily.rows : [],
+              dailySeries: daily && daily.series ? daily.series : [],
               dailyPeak: daily ? daily.peak : null,
+              sparkUnlocks: cards && cards.spark ? cards.spark.unlocks || [] : [],
+              sparkUsers: cards && cards.spark ? cards.spark.users || [] : [],
+              sparkRevenue: cards && cards.spark ? cards.spark.netRevenue || [] : [],
               dailySource: daily ? daily.source : "",
               threshold: EARN_THRESHOLD,
               payoutExpected: payout,
@@ -1512,7 +1720,7 @@ jobs:
               updatedAt: Date.now(),
               updatedBy: "bot",
             };
-            earnLog(JSON.stringify({ ...payload, daily: `${payload.daily.length} points` }));
+            earnLog(JSON.stringify({ ...payload, daily: `${payload.daily.length} points`, dailyRows: `${payload.dailyRows.length} days`, sparkUnlocks: undefined, sparkUsers: undefined, sparkRevenue: undefined }));
             await earnPush(payload);
             return payload;
           }

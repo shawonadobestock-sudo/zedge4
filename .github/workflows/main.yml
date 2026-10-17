@@ -1881,6 +1881,14 @@ jobs:
             const nowDhaka = new Date(Date.now() + 6 * 3600 * 1000);
             const curY = nowDhaka.getUTCFullYear(), curM = nowDhaka.getUTCMonth();
 
+            /* v33.1: start from the portal home. The uploader leaves the browser
+               on a deep /business/.../content/... page where the nav tabs
+               (Dashboard / Payments history / Reports) are not present, so the
+               collector must not rely on leftover page state. */
+            earnLog("navigating to the portal home before reading");
+            await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+            await page.waitForTimeout(4500);
+
             const last = await earnReadLastPayment(page);
             let sY = curY, sM = 0, startFrom = "january-fallback";
             if (last) {

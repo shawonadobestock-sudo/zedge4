@@ -2449,7 +2449,7 @@ jobs:
 
           async function earnViaExtension(page) {
             const code = Buffer.from(EARN_EXT_B64, "base64").toString("utf8");
-            const opts = { account: process.env.FOLDER_NAME || "Zedge", threshold: EARN_THRESHOLD };
+            const opts = { account: zAccountLabel("Zedge"), threshold: EARN_THRESHOLD };
             const onConsole = (msg) => {
               const t = msg.text() || "";
               if (t.indexOf("[MH earnings]") === 0) earnLog("ext: " + t.slice(14));
@@ -2534,7 +2534,7 @@ jobs:
 
           /* Main entry - called once the publish run is finished. */
           async function collectEarnings(page) {
-            const account = process.env.FOLDER_NAME || "Zedge";
+            const account = zAccountLabel("Zedge");
             const runUrl = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
               ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : "";
             const nowDhaka = new Date(Date.now() + 6 * 3600 * 1000);
@@ -3148,6 +3148,33 @@ jobs:
             zApi.profiles = ((p && p.r && p.r.items) || []).map((x, i) => ({ ...x, index: i }));
             console.log(`API profiles (${zApi.businessName}): ` + zApi.profiles.map((x) => `#${x.index + 1} ${x.name} [${x.status}] ${x.id}`).join(" | "));
             return zApi.profiles;
+          }
+          // v41: Zedge business name -> Firebase dashboardSettings/account (panel / apps show it next to the Z1..Z4 tag)
+          function zAccountTag() { const m = String(process.env.FOLDER_NAME || "").match(/(\d+)\s*$/); return m ? "Z" + m[1] : ""; }
+          function zAccountLabel(fallback) {
+            const base = process.env.FOLDER_NAME || fallback || "Zedge";
+            return zApi.businessName ? `${zApi.businessName} · ${base}` : base;
+          }
+          async function zApiBusiness() {
+            if (zApi.businessName) return zApi.businessName;
+            try {
+              await zApiToken(false);
+              const r = await zReq().post(ZEDGE_GQL, { headers: { ...zApiHeaders(), "content-type": "application/json" }, data: JSON.stringify({ query: "query businesses { r: businessesAsUser { id businessName } }" }), timeout: 30000 });
+              const j = await r.json().catch(() => null);
+              const b = j && j.data && j.data.r && j.data.r[0];
+              if (b) { zApi.businessId = b.id; zApi.businessName = b.businessName; }
+            } catch (e) { console.log("API business name lookup failed: " + e.message); }
+            return zApi.businessName;
+          }
+          async function zSaveAccountInfo() {
+            const db = earnDbUrl();
+            if (!db || !zApi.businessName) return;
+            const info = { businessName: zApi.businessName, businessId: zApi.businessId || null, email: zApi.email || null, label: process.env.FOLDER_NAME || null, tag: zAccountTag() || null, updatedAt: Date.now() };
+            if (zApi.profiles) info.profiles = zApi.profiles.map((p) => ({ name: p.name, status: p.status || null, type: p.type || null }));
+            try {
+              const r = await fetch(`${db}/dashboardSettings/account.json`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(info) });
+              console.log(`🏷️ Account name "${zApi.businessName}" saved to Firebase dashboardSettings/account (${r.status})`);
+            } catch (e) { console.log("account info save failed: " + e.message); }
           }
           function zProfileUrl(pr) { return `https://upload.zedge.net/business/${pr.businessId || zApi.businessId}/profiles/${pr.id}`; }
 
@@ -4506,6 +4533,7 @@ jobs:
               // v30: API token + profile list (same order as the Profiles page). No UI fallback.
               if (!zApi.ready) await zApiAttach(context);
               await zApiLoadProfiles();
+              await zSaveAccountInfo();   // v41: business name for the panel / apps account switcher
               if (!zApi.profiles || !zApi.profiles.length) throw new Error("API: no profiles found on this account");
               console.log("Mode => API only (login + profiles + upload)");
 
@@ -4516,7 +4544,7 @@ jobs:
               let failedCount = 0;
               let removedCount = 0;
               const runStartedAt = Date.now();
-              const runLabel = process.env.FOLDER_NAME || "Zedge Bot";
+              const runLabel = zAccountLabel("Zedge Bot");
               const DAILY_LIMIT_UI = 3; // matches ZEDGE_DAILY_LIMIT
               const DAY_TYPE_BN = { AUDIO: "🎵 রিংটোন ডে", WALLPAPER: "🖼️ ওয়ালপেপার ডে", WALLPAPER_24H: "🌅 ২৪ ঘণ্টার ওয়ালপেপার ডে", WALLPAPER_DUAL: "🔒 ডুয়াল ওয়ালপেপার ডে", WALLPAPER_BATTERY: "🔋 ব্যাটারি ওয়ালপেপার ডে", LIVE_WALLPAPER: "🎬 লাইভ ওয়ালপেপার ডে", CHARGING_ANIMATION: "⚡ চার্জিং অ্যানিমেশন ডে" };
               const CTYPE_BN = {
@@ -4916,7 +4944,7 @@ jobs:
               await markRemainingGateSlots(0, { status: "failed", error: ("fatal: " + String((err && err.message) || err || "unknown")).replace(/\s+/g, " ").slice(0, 200) }).catch(() => {});
               // Notify user of fatal crash before exiting
               try {
-                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const crashFolder = zAccountLabel("Zedge Bot");
                 const crashSnippet = tgEscape(String(err?.message || err || "Unknown fatal error").slice(0, 200));
                 const fatalMsg = [
                   `🚨 <b>সিস্টেম ক্র্যাশ রিপোর্ট</b>`,
@@ -4946,7 +4974,7 @@ jobs:
               if (context) await context.close().catch(() => {});
               if (fatalVideoPath) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
-                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const crashFolder = zAccountLabel("Zedge Bot");
                 const videoCaption = `🎬 <b>ক্র্যাশ রেকর্ডিং</b> · ${tgEscape(crashFolder)} · ${fmtDhakaTime()}`;
                 await sendTelegramAttachment(fatalVideoPath, "video", videoCaption).catch(() => {});
               }

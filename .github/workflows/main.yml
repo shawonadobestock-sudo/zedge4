@@ -3067,11 +3067,44 @@ jobs:
             return h;
           }
 
+          // v41.3: generic GraphQL input fixer. Reads "$input got invalid value" errors and patches the input (also nested, e.g. paymentLock).
+          function zFixInput(input, msg) {
+            if (!input || !msg) return [];
+            const notes = [];
+            const dflt = (t, f) => /^\[/.test(t) ? [] : /^Boolean/.test(t) ? false : /^(Int|Float)/.test(t) ? 0 : /^String/.test(t) ? ""
+              : /Input!?$/.test(t) ? {} : /lock/i.test(t + " " + f) ? "VIDEO" : undefined;
+            const walk = (o, keys) => { for (const k of keys) { if (!o || typeof o !== "object") return null; if (!(k in o) || o[k] === null || typeof o[k] !== "object") o[k] = {}; o = o[k]; } return o; };
+            const findOwner = (o, key) => { if (!o || typeof o !== "object") return null; if (key in o) return o; for (const v of Object.values(o)) { const r = v && typeof v === "object" && !Array.isArray(v) ? findOwner(v, key) : null; if (r) return r; } return null; };
+            for (const seg of msg.split(/;\s*(?=Variable "\$input")/)) {
+              const pm = /at "input((?:\.\w+)*)"/.exec(seg), path = pm && pm[1] ? pm[1].slice(1).split(".") : [];
+              let m;
+              if ((m = /Field "(\w+)" is not defined by type "(\w+)"(?:\. Did you mean "(\w+)")?/.exec(seg))) {
+                const o = path.length ? walk(input, path) : findOwner(input, m[1]);
+                if (o && m[1] in o) { const v = o[m[1]]; delete o[m[1]]; if (m[3] && !(m[3] in o)) { o[m[3]] = v; notes.push(`${m[1]} -> ${m[3]}`); } else notes.push(`-${m[1]}`); }
+              } else if ((m = /Field "(\w+)" of required type "([^"]+)" was not provided/.exec(seg))) {
+                const o = walk(input, path), d = dflt(m[2], m[1]);
+                if (o && !(m[1] in o) && d !== undefined) { o[m[1]] = d; notes.push(`+${path.concat(m[1]).join(".")}=${JSON.stringify(d)}`); }
+              } else if (path.length) {
+                const key = path[path.length - 1], o = walk(input, path.slice(0, -1));
+                if (o && key in o) {
+                  const sug = /Did you mean the enum value "(\w+)"/.exec(seg), nn = /non-nullable type "([^"]+)"/.exec(seg);
+                  const old = JSON.stringify(o[key]);
+                  if (sug) o[key] = sug[1];
+                  else if (nn && dflt(nn[1], key) !== undefined) o[key] = dflt(nn[1], key);
+                  else if (key === "categoryId" && typeof o[key] === "number") o[key] = String(o[key]);
+                  else delete o[key];
+                  if (JSON.stringify(o[key]) !== old) notes.push(`${path.join(".")}=${JSON.stringify(o[key])}`);
+                }
+              }
+            }
+            return notes;
+          }
+
           // one GraphQL call. files = [{ path: "variables.file", local: "C:/x.jpg" }] -> multipart (GraphQL upload spec)
           async function zGql(label, query, variables, files, tries) {
             tries = tries || 3;
             variables = JSON.parse(JSON.stringify(variables || {}));
-            let lastErr;
+            let lastErr, zFix = 0;
             for (let i = 1; i <= tries; i++) {
               try {
                 await zApiToken(false);
@@ -3110,12 +3143,15 @@ jobs:
                 if (body.errors && body.errors.length) {
                   const msg = body.errors.map((e) => e.message).join("; ");
                   // unknown input field (e.g. limitedEdition not in ChargeScreenMetaAsUserInput) -> drop it and retry at once
-                  const uf = /Field "(\w+)" is not defined by type "(\w+)"/.exec(msg);
-                  if (uf && variables.input && uf[1] in variables.input) {
-                    console.log(`API ${label}: "${uf[1]}" is not in ${uf[2]} - removed, retrying`);
-                    delete variables.input[uf[1]]; i--; continue;
+                  // v41.3: invalid input -> auto-fix (unknown field / rename / required missing / nested paymentLock), then retry
+                  if (/got invalid value/.test(msg)) console.log(`API ${label}: full validation error -> ${msg}`);
+                  if (variables.input && zFix < 8) {
+                    const fx = zFixInput(variables.input, msg);
+                    if (fx.length) { zFix++; console.log(`API ${label}: input fixed [${fx.join(", ")}] -> ${JSON.stringify(variables.input)}, retrying`); i--; continue; }
                   }
-                  const err = new Error(msg);
+                  // short reason for Telegram: drop the echoed input object, keep the real cause
+                  const short = msg.replace(/got invalid value [\s\S]*?;\s*(?=(Field|Expected|Value|In field|Int|Float|String|Boolean|ID)\b)/g, "invalid -> ");
+                  const err = new Error(short);
                   if (Z_AUTH_ERR.test(msg)) { zApi.token = null; console.log(`API ${label}: token expired/invalid -> new token`); }
                   else err.noRetry = true;                                    // validation / business errors: don't hammer
                   throw err;
@@ -3229,6 +3265,11 @@ jobs:
               externalId: null
             };
             if (cfg.limitedEdition) input.limitedEdition = null;
+            // v41.3: Dual / Battery / 24H use DynamicWallpaperMetadataUpdateInput (matureContent + paymentLock instead of lockType/priceUsd)
+            if (cfg.kind === "multi") {
+              return { name: input.name, description: input.description, categoryId: input.categoryId, tags: input.tags,
+                externalId: null, matureContent: false, paymentLock: { lockType: "VIDEO", priceUsd: null } };   // exact shape from upload.zedge.net HAR (dual / 24h / battery)
+            }
             return input;
           }
 
@@ -3249,7 +3290,7 @@ jobs:
             if (lim && lim.r && lim.r.uploadAllowed === false) { const e = new Error(`Zedge upload limit reached (${lim.r.uploadLimit} per ${lim.r.uploadLimitDurationDays} days)`); e.noFallback = true; throw e; }
             const categoryId = meta.category ? await zCategoryId(cfg.cat, meta.category) : null;
             const input = zMetaInput(meta, cfg, categoryId);
-            console.log(`API meta: name="${input.name}" categoryId=${categoryId} tags=[${input.tags.join(", ")}] lock=${input.lockType}`);
+            console.log(`API meta: name="${input.name}" categoryId=${categoryId} tags=[${input.tags.join(", ")}] lock=${input.lockType || (input.paymentLock && input.paymentLock.lockType)}`);
 
             let id = null, fold = null;
             try {
@@ -3259,9 +3300,30 @@ jobs:
                 const d = await zGql("create " + zType, "mutation " + cfg.create, vars, [{ path: "variables.file", local: files[0] }], 2);
                 id = d.r.id;
                 console.log(`API: ${zType} created -> ${id}`);
-                if (cfg.cover && coverImage && fs.existsSync(coverImage)) {
-                  try { await zGql("cover image", "mutation " + cfg.cover, { profileId, input: { [cfg.coverKey]: id, file: null } }, [{ path: "variables.input.file", local: coverImage }], 2); }
-                  catch (ce) { console.warn("API cover upload issue (continuing): " + ce.message); }
+                // v41.5: the site ALWAYS sends a cover for live / charging (HAR). No thumbnail or cover upload fails -> frame from the video (ffmpeg)
+                const autoCover = () => {
+                  try {
+                    const ff = findFfmpeg(); if (!ff) return null;
+                    const out = files[0].replace(/\.[^.\\/]+$/, "") + "-autocover.jpg";
+                    for (const ss of ["1", "0"]) {
+                      try { require("child_process").execFileSync(ff, ["-y", "-loglevel", "error", "-ss", ss, "-i", files[0], "-frames:v", "1", "-q:v", "2", out], { stdio: "ignore", timeout: 60000 }); } catch (x) {}
+                      if (fs.existsSync(out) && fs.statSync(out).size > 1000) { console.log(`🖼️ auto cover from video frame (${ss}s)`); return out; }
+                    }
+                  } catch (x) { console.warn("auto cover failed: " + x.message); }
+                  return null;
+                };
+                if (cfg.cover) {
+                  let cv = coverImage && fs.existsSync(coverImage) ? coverImage : autoCover();
+                  const upCover = (f) => zGql("cover image", "mutation " + cfg.cover, { profileId, input: { [cfg.coverKey]: id, file: null } }, [{ path: "variables.input.file", local: f }], 2);
+                  if (!cv) console.warn("⚠️ no cover image (no thumbnail, ffmpeg frame failed) - continuing without cover");
+                  else {
+                    try { await upCover(cv); }
+                    catch (ce) {
+                      console.warn("API cover upload issue: " + ce.message);
+                      const af = cv === coverImage ? autoCover() : null;
+                      if (af) { try { await upCover(af); } catch (ce2) { console.warn("auto cover upload also failed (continuing): " + ce2.message); } }
+                    }
+                  }
                 }
                 // v31: foldable / tablet landscape companion (before publish, like the site). A failure never blocks the wallpaper.
                 if (cfg.fold && foldImage && fs.existsSync(foldImage)) {
